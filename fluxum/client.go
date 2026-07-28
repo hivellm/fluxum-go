@@ -136,6 +136,10 @@ type Connection struct {
 	schemas    map[string]TableSchema
 	cache      *Cache
 
+	// lightUpdates negotiates RPC-035 TxUpdateLight broadcasts (provenance
+	// stripped, row diffs + resume cursor kept); re-applied per reconnect.
+	lightUpdates bool
+
 	mu       sync.Mutex
 	conn     net.Conn
 	frames   *frameReader
@@ -150,6 +154,12 @@ type Connection struct {
 // Connect opens and authenticates a session. url is fluxum://host:port or a
 // bare host:port (TCP). The context bounds the initial connect + handshake.
 func Connect(ctx context.Context, url string, token []byte, tables []TableSchema) (*Connection, error) {
+	return ConnectLight(ctx, url, token, tables, false)
+}
+
+// ConnectLight is Connect with the RPC-035 tx_updates negotiation: when
+// light is true the session receives TxUpdateLight broadcasts.
+func ConnectLight(ctx context.Context, url string, token []byte, tables []TableSchema, light bool) (*Connection, error) {
 	host, port, err := parseURL(url)
 	if err != nil {
 		return nil, err
@@ -159,15 +169,16 @@ func Connect(ctx context.Context, url string, token []byte, tables []TableSchema
 		schemas[t.Name] = t
 	}
 	c := &Connection{
-		host:     host,
-		port:     port,
-		token:    token,
-		schemas:  schemas,
-		cache:    newCache(tables),
-		nextID:   1,
-		pending:  map[uint32]chan serverMessage{},
-		identity: strings.Repeat("00", 32),
-		done:     make(chan struct{}),
+		host:         host,
+		port:         port,
+		token:        token,
+		schemas:      schemas,
+		cache:        newCache(tables),
+		lightUpdates: light,
+		nextID:       1,
+		pending:      map[uint32]chan serverMessage{},
+		identity:     strings.Repeat("00", 32),
+		done:         make(chan struct{}),
 	}
 	if err := c.establish(ctx); err != nil {
 		return nil, err
@@ -223,8 +234,13 @@ func (c *Connection) establish(ctx context.Context) error {
 	}
 
 	// Authenticate inline (the reader goroutine is not looping yet).
+	// Payload: [id, token, compression, tx_updates, namespace].
 	authID := c.allocID()
-	if err := c.sendRaw("Authenticate", []any{authID, c.token, nil, nil, nil}); err != nil {
+	var txUpdates any
+	if c.lightUpdates {
+		txUpdates = "light"
+	}
+	if err := c.sendRaw("Authenticate", []any{authID, c.token, nil, txUpdates, nil}); err != nil {
 		return err
 	}
 	for {
@@ -347,7 +363,7 @@ func (c *Connection) readLoop() {
 
 // route runs with c.mu held.
 func (c *Connection) route(msg serverMessage) {
-	if msg.tag == "TxUpdate" {
+	if msg.tag == "TxUpdate" || msg.tag == "TxUpdateLight" {
 		c.applyTxUpdate(msg)
 		return
 	}
@@ -479,7 +495,7 @@ func (c *Connection) resubscribeInline(queries []string) error {
 		if msg.tag == "Error" && msgID(msg) == int(id) {
 			return errorFrom(msg)
 		}
-		if msg.tag == "TxUpdate" {
+		if msg.tag == "TxUpdate" || msg.tag == "TxUpdateLight" {
 			c.mu.Lock()
 			c.applyTxUpdate(msg)
 			c.mu.Unlock()
@@ -574,12 +590,19 @@ func (c *Connection) CallReducer(ctx context.Context, name string, args []any) e
 	return &Error{Code: 0, Message: "unexpected reply to reducer call: " + msg.tag}
 }
 
-// applyTxUpdate runs with c.mu held.
+// applyTxUpdate runs with c.mu held. Handles both broadcast forms: the
+// enriched TxUpdate carries tables at index 5, the RPC-035 TxUpdateLight
+// ([tx_id, timestamp, tables, shard_id, tx_offset]) at index 2 — same row
+// diffs, provenance stripped.
 func (c *Connection) applyTxUpdate(msg serverMessage) {
-	if len(msg.payload) < 6 {
+	tablesAt := 5
+	if msg.tag == "TxUpdateLight" {
+		tablesAt = 2
+	}
+	if len(msg.payload) <= tablesAt {
 		return
 	}
-	tables, ok := msg.payload[5].([]any)
+	tables, ok := msg.payload[tablesAt].([]any)
 	if !ok {
 		return
 	}

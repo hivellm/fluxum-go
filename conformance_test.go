@@ -314,8 +314,10 @@ func (in *interp) runStep(ctx context.Context, kind string, body map[string]any)
 		if tok, ok := body["token"]; ok && tok != nil {
 			token = []byte(fmt.Sprintf("%v", tok))
 		}
+		// RPC-035: the light-updates scenario negotiates TxUpdateLight.
+		light, _ := body["light_updates"].(bool)
 		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		conn, err := fluxum.Connect(cctx, in.srv.tcpURL(), token, in.tableSchemas())
+		conn, err := fluxum.ConnectLight(cctx, in.srv.tcpURL(), token, in.tableSchemas(), light)
 		cancel()
 		if err != nil {
 			t.Fatalf("connect %s: %v", name, err)
